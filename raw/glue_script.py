@@ -16,18 +16,16 @@ args = getResolvedOptions(sys.argv, [
 # ── Configure spark ───────────────────────────────────────────────────────────
 
 # Initialize a spark context
-#### YOUR CODE HERE
+sc = SparkContext.getOrCreate()
 
-# Wrap the spark context in a GlueContext
-#### YOUR CODE HERE
+glueContext = GlueContext(sc)
 
-# Store the glue context's spark_session to the variable `spark`
-#### YOUR CODE HERE
+spark = glueContext.spark_session
+
 
 # Init a glue job
 job = Job(glueContext)
 job.init(args["JOB_NAME"], args) 
-
 # ── Set up locations ────────────────────────────────────────────────────────────
 
 table = args["table"]
@@ -55,7 +53,7 @@ df = df.withColumn("data_interval", F.lit(data_interval))
 # ── Write to Iceberg ────────────────────────────────────────────────────────────
 
 # Check if the table exists
-#### YOUR CODE HERE
+if not spark.catalog.tableExists(ICEBERG_TABLE):
 
     # If the table doesn't exists create the table and write 
     # the raw data to it using iceberg
@@ -63,11 +61,11 @@ df = df.withColumn("data_interval", F.lit(data_interval))
         df
         .writeTo(ICEBERG_TABLE)
         # Set "data_interval" as the partition column
-        #### YOUR CODE HERE
+        .partitionedBy("data_interval")
         # Use Iceberg as the table format
-        #### YOUR CODE HERE
+        .using("iceberg")
         # Set Parquet as the storage format for data files
-        #### YOUR CODE HERE
+        .tableProperty("write.format.default", "parquet")
         # Snappy compression: high write speed, high read speed, moderate storage costs
         .tableProperty("write.parquet.compression-codec", "snappy")
         .create()
@@ -76,8 +74,9 @@ df = df.withColumn("data_interval", F.lit(data_interval))
 else:
     # If the table exists, overwrite the partitions
     # found in the raw data
-    #### YOUR CODE HERE
-    print(f"[{table}] Overwrote partition data_interval={data_interval}")
+    df.writeTo(ICEBERG_TABLE).overwritePartitions()
+    print(f"[{table}] Overwrote partition data_inteval={data_interval}")
+  
 
 count = spark.sql(f"""
     SELECT COUNT(*) FROM {ICEBERG_TABLE}

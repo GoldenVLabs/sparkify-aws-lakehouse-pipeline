@@ -3,34 +3,34 @@ from pathlib import Path
 from airflow.sdk import TaskGroup
 
 # Import dag, task, and Asset objects
-#### YOUR CODE HERE
+from airflow.sdk import dag, task, Asset
 
 # Import GlueJobOperator
-#### YOUR CODE HERE
+from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 
 # Import SQLCheckOperator
-#### YOUR CODE HERE
+from airflow.providers.common.sql.operators.sql import SQLCheckOperator
 
 # Import S3Hook
-#### YOUR CODE HERE
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 CWD                    = Path(__file__).parent
 S3_BUCKET              = "{{ var.value.s3_bucket }}"
-S3_SQL                 = 'artifacts/transactions/sql/{{ dag_run.run_id }}'
+S3_SQL                 = 'artifacts/transactions/sql/{{ dag_run.run_id }}/'
 RAW_DB                 = "raw"
 TRANSACTIONS_DB        = "transactions"
 WAREHOUSE_PATH         = f"s3://{S3_BUCKET}/iceberg-warehouse/transactions/"
 PROMOTE_SCRIPT         = CWD / "glue_script.py"
 GLUE_ROLE_NAME         = "dev-lakehouse-glue-role"
 AWS_CONN_ID            = "aws_default"
+ATHENA_CONN_ID         = "athena_default"
 REGION                 = 'us-east-1'
 SQL_DIR                = Path(__file__).parent / 'sql'
 
 # Define an Asset used to trigger transactions when raw ingestion has completed
-#### YOUR CODE HERE
+RAW_INGESTION_COMPLETE = Asset("raw_ingestion_complete")
 
-# Define an Asset to indicate transactions has completed (Triggers analytics)
-#### YOUR CODE HERE
+TRANSACTIONS_COMPLETE = Asset("transactions_complete")
 
 # Each table declares its upstream transactions tables in `depends_on`.
 # An empty list means the table can be promoted as soon as the branch fires.
@@ -80,7 +80,13 @@ TABLES = [
 #   is emitted
 # - Limit the active tasks to 2
 # - Limit the active runs to 1
-#### YOUR CODE HERE
+@dag(
+    dag_id="transactions",
+    schedule=RAW_INGESTION_COMPLETE,
+    max_active_tasks=2,
+    max_active_runs=1,
+)
+def transactions():
 
     # Pull metadata from triggering asset event
     @task(inlets=[RAW_INGESTION_COMPLETE])
@@ -98,7 +104,7 @@ TABLES = [
         }
 
     # Call the metadata task function and assign the output to a variable
-    #### YOUR CODE HERE
+    metadata_task = metadata()
 
     # Build promotion tasks first — store handles in a dict so we can wire
     # cross-table dependencies after every task exists.
@@ -122,7 +128,14 @@ TABLES = [
             # Initialize an S3 Hook
             # and push the sql_rendered string
             # to the inputted s3 bucket and s3 key
-            #### YOUR CODE HERE
+            s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+
+            s3_hook.load_string(
+                string_data=sql_rendered,
+                key=s3_key,
+                bucket_name=s3_bucket,
+                replace=True,
+        )
 
         # Set up table-specific configurations
         payload = {"sql": f"s3://{S3_BUCKET}/{SQL_KEY}"}
@@ -160,14 +173,14 @@ TABLES = [
         # Call the `upload` task function.
         # Pass the SQL, S3_BUCKET, and SQL_KEY variables as arguments
         # Assign the output to a variable
-        #### YOUR CODE HERE
+        upload_task = upload(SQL, S3_BUCKET, SQL_KEY)
 
         # Set the metadata task upstream to the upload task
-        #### YOUR CODE HERE
+        metadata_task >> upload_task
 
         # Store the upload task's output in the `upload_task` dictionary
         # Use the table_name variable as the dictionary key
-        #### YOUR CODE HERE
+        upload_tasks[table_name] = upload_task
 
         # Store the `promote` task in the `promote_tasks` dictionary
         # - Use the table_name variable as the dictionary key
@@ -178,46 +191,48 @@ TABLES = [
 
         for table in TABLES:
             table_name = table["table"]
-            pk_expr    = ", ".join(table["upsert_keys"])
+            pk_expr = ", ".join(table["upsert_keys"])
 
-            # Pass the following SQL query to an SQLCheckOperator with an Athena Connection
-            # - Ensure the task id is unique to each table
-            # - Ensure the task is triggered as long as
-            #   one upstream task succeeds and none have failed
-            # - Do not assign the operator to a variable. 
-            f"""
+            SQLCheckOperator(
+                task_id=f"validate_{table_name}",
+                conn_id=ATHENA_CONN_ID,
+                trigger_rule="none_failed_min_one_success",
+                sql=f"""
+                    SELECT CASE
+                        WHEN COUNT(*) = COUNT(DISTINCT ({pk_expr}))
+                        THEN 1 ELSE 0
+                    END
+                    FROM transactions.{table_name}
+                """
+            )
+
+        SQLCheckOperator(
+            task_id="validate_event_versions",
+            conn_id=ATHENA_CONN_ID,
+            trigger_rule="none_failed_min_one_success",
+            sql="""
                 SELECT CASE
-                    WHEN COUNT(*) = COUNT(DISTINCT ({pk_expr}))
+                    WHEN COUNT(*) = 0 THEN 1
+                    WHEN CAST(SUM(CASE WHEN version_id IS NULL THEN 1 ELSE 0 END) AS DOUBLE)
+                        / COUNT(*) < 0.30
                     THEN 1 ELSE 0
                 END
-                FROM transactions.{table_name}
+                FROM transactions.events
             """
-
-
-        # Pass the following SQL query to an SQLCheckOperator with an Athena Connection
-        # - Ensure the task is triggered as long as
-        #   one upstream task succeeds and none have failed
-        # - This task should be initialized outside of the for loop above
-        # - Do not assign the operator to a variable
-        """
-            SELECT CASE
-                WHEN COUNT(*) = 0 THEN 1
-                WHEN CAST(SUM(CASE WHEN version_id IS NULL THEN 1 ELSE 0 END) AS DOUBLE)
-                     / COUNT(*) < 0.30
-                THEN 1 ELSE 0
-            END
-            FROM transactions.events
-            """
+        )
 
 
     # Alter this task so it emits an event indicating transactions
     # have been updated. 
     @task(
-        #### YOUR CODE HERE
+        outlets=[TRANSACTIONS_COMPLETE],
         trigger_rule="none_failed"
-        )
-    def notify_complete() -> None:
-        pass
+    )
+    def notify_complete(metadata: dict, outlet_events=None) -> None:
+        outlet_events[TRANSACTIONS_COMPLETE].extra = {
+            "data_interval": metadata["data_interval"],
+            "tables": [table["table"] for table in TABLES],
+        }
         
     # Wire dependencies
     for table in TABLES:
@@ -225,16 +240,22 @@ TABLES = [
 
         # Set the upload task (inside the upload_tasks dictionary) 
         # upstream to the table's promote task (inside the `promote_task` dictionary)
-        #### YOUR CODE HERE
+        upload_tasks[table_name] >> promote_tasks[table_name]
 
+   
         # Set inter table dependencies
         for upstream in table["depends_on"]:
             promote_tasks[upstream] >> promote_tasks[table_name]
 
         # Set the table's promotion task inside the `promote_tasks` dictionary
         # upstream to the `validate_transactions` task group
-        #### YOUR CODE HERE
+        promote_tasks[table_name] >> validate_transactions
 
     # Set the `validate_transactions` task group upstream
     # to the `notify_complete` task function.
-    #### YOUR CODE HERE
+    validate_transactions >> notify_complete(metadata_task)
+transactions_dag = transactions()
+
+
+  
+ 

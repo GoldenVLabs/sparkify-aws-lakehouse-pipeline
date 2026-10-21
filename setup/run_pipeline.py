@@ -21,7 +21,8 @@ with DAG(
     def emit_ready(params, **context) -> None:
 
         context["outlet_events"][RAW_INGESTION_PENDING].extra = {
-            "data_interval"     : params["data_interval"],
+            "data_interval": params["data_interval"],
+            "tables": [],
         }
 
     emit_ready()

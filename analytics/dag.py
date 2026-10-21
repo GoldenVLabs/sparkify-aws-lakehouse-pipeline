@@ -9,14 +9,14 @@ CWD                    = Path(__file__).parent
 SQL                    = CWD / "sql"
 GLUE_SCRIPT            = CWD / "glue_script.py"
 S3_BUCKET              = "{{ var.value.s3_bucket }}"
-S3_SQL                 = "artifacts/analytics/sql/{{ dag_run.run_id }}"
+S3_SQL                 = "artifacts/analytics/sql/{{ dag_run.run_id }}/"
 WAREHOUSE_PATH         = f"s3://{S3_BUCKET}/iceberg-warehouse/analytics/"
 GLUE_ROLE_NAME         = "dev-lakehouse-glue-role"
 AWS_CONN_ID            = "aws_default"
 REGION                 = "us-east-1"
 
 # Initialize an Asset that is emitted on completion of the transactions dag
-#### YOUR CODE HERE
+TRANSACTIONS_COMPLETE = Asset("transactions_complete")
 
 
 # Initialize an Airflow DAG
@@ -24,7 +24,12 @@ REGION                 = "us-east-1"
 # - Trigger the dag when the final event is emitted from the transactions dag
 # - Set the maximum active runs to 1
 # - Set the maximum active tasks to 2
-#### YOUR CODE HERE
+with DAG(
+    dag_id="analytics",
+    schedule=TRANSACTIONS_COMPLETE,
+    max_active_runs=1,
+    max_active_tasks=2,
+) as dag:
 
     # Loop over sql files
     for query in SQL.glob("*.sql"):
@@ -34,7 +39,7 @@ REGION                 = "us-east-1"
 
         # Convert the below function to an airflow task
         # - Set the task id to f"{table_name}_upload_sql"
-        #### YOUR CODE HERE
+        @task(task_id=f"{table_name}_upload_sql")
         def upload(file, s3_bucket, s3_key, **context):
 
             ti = context["ti"]
@@ -42,7 +47,14 @@ REGION                 = "us-east-1"
             sql_rendered = ti.task.render_template(sql_template, context)
 
             # Initialize an S3Hook and push the rendered SQL to S3
-            #### YOUR CODE HERE
+            s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+
+            s3_hook.load_string(
+                string_data=sql_rendered,
+                key=s3_key,
+                bucket_name=s3_bucket,
+                replace=True,
+            )
 
         payload = {
             "sql"   : f"s3://{S3_BUCKET}/{SQL_KEY}",
@@ -78,4 +90,4 @@ REGION                 = "us-east-1"
         # Task dependencies
         # Call the upload task function
         # and set it upstream to the promote task
-        #### YOUR CODE HERE
+        upload(query, S3_BUCKET, SQL_KEY) >> promote
